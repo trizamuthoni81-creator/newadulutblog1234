@@ -32,3 +32,9 @@ services:
         value: "https://adultblog-api.onrender.com"
       - key: SYNC_INTERVAL_MS
         value: "120000"
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_SECRET
+        sync: false
+      - key: RTC_FORCE_RELAY
+        value: "false"

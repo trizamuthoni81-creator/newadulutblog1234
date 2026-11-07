@@ -72,6 +72,13 @@ app.get('/api/avatar/:userId', (req, res) => {
   res.sendFile(p);
 });
 
+app.get('/api/rtc/config', requireAuth, (req, res) => {
+  if (req.user.status !== 'active' || (!req.user.verified && req.user.role !== 'admin')) return res.status(403).json({ error: 'Active identity verification is required for video connections' });
+  res.set('Cache-Control', 'no-store');
+  try { res.json(require('./src/rtc').buildRTCConfig(req.user.id)); }
+  catch (err) { console.error('[RTC configuration]', err.message); res.status(503).json({ error: 'Video relay configuration is invalid. Ask the administrator to check TURN settings.' }); }
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 app.get('/', (req, res) => res.json({ service: 'AdultBlog API', docs: '/api/health', admin: '/admin' }));
 
@@ -81,99 +88,7 @@ const io = new Server(server, {
 });
 app.set('io', io);
 
-const viewers = new Map(); // live_id -> Set(socketId)
-const endTimers = new Map(); // live_id -> grace timeout (broadcaster reconnect window)
-
-io.use((socket, next) => {
-  try {
-    const token = socket.handshake.auth && socket.handshake.auth.token;
-    const payload = jwt.verify(token, JWT_SECRET);
-    const u = q.get('SELECT id,name,role,status,restricted FROM users WHERE id=?', payload.id);
-    if (!u || u.status !== 'active') return next(new Error('unauthorized'));
-    socket.user = u;
-    next();
-  } catch (e) { next(new Error('unauthorized')); }
-});
-
-io.on('connection', (socket) => {
-  // Join a live room: model = broadcaster, clients = viewers (must have paid access)
-  socket.on('join_live', ({ live_id }) => {
-    const live = q.get("SELECT * FROM lives WHERE id=? AND status='live'", live_id);
-    if (!live) return socket.emit('error_msg', { error: 'Live not found or already ended' });
-    const isModel = live.model_id === socket.user.id;
-    const isStaff = ['admin'].includes(socket.user.role);
-    if (!isModel && !isStaff) {
-      const access = q.get('SELECT id FROM live_access WHERE live_id=? AND user_id=?', live_id, socket.user.id);
-      if (!access) return socket.emit('error_msg', { error: 'Payment required to watch this live' });
-    }
-    // Broadcaster rejoined within the grace window — cancel the pending auto-end
-    if (isModel && endTimers.has(live_id)) { clearTimeout(endTimers.get(live_id)); endTimers.delete(live_id); }
-    socket.join(`live:${live_id}`);
-    socket.data.live_id = live_id;
-    socket.data.is_broadcaster = isModel;
-    if (!viewers.has(live_id)) viewers.set(live_id, new Set());
-    viewers.get(live_id).add(socket.id);
-    // Broadcaster (re)joined — tell them who is already watching so every current
-    // viewer receives a fresh WebRTC offer (keeps the stream alive for viewers even
-    // when the broadcaster refreshes the page or briefly drops the connection)
-    if (isModel) {
-      const already = [...viewers.get(live_id)].filter(sid => sid !== socket.id);
-      if (already.length) socket.emit('existing_viewers', { viewers: already });
-    }
-    const count = viewers.get(live_id).size - 1; // minus broadcaster
-    q.run('UPDATE lives SET peak_viewers = MAX(peak_viewers, ?) WHERE id=?', Math.max(0, count), live_id);
-    io.to(`live:${live_id}`).emit('viewer_count', { live_id, count: Math.max(0, count) });
-    if (!isModel) socket.to(`live:${live_id}`).emit('viewer_joined', { socketId: socket.id });
-    // recent chat history
-    const history = q.all(`SELECT c.message, c.created_at, u.name, u.role FROM chat c JOIN users u ON u.id=c.user_id
-                           WHERE c.live_id=? ORDER BY c.id DESC LIMIT 30`, live_id).reverse();
-    socket.emit('chat_history', history);
-  });
-
-  // WebRTC signaling relay
-  socket.on('webrtc_offer', ({ to, sdp }) => io.to(`live:${socket.data.live_id}`).emit('webrtc_offer', { from: socket.id, to, sdp }));
-  socket.on('webrtc_answer', ({ to, sdp }) => io.to(`live:${socket.data.live_id}`).emit('webrtc_answer', { from: socket.id, to, sdp }));
-  socket.on('webrtc_ice', ({ to, candidate }) => io.to(`live:${socket.data.live_id}`).emit('webrtc_ice', { from: socket.id, to, candidate }));
-
-  socket.on('chat', ({ live_id, message }) => {
-    if (socket.user.restricted) return socket.emit('error_msg', { error: 'Your account is restricted from chatting' });
-    const msg = String(message || '').trim().slice(0, 300);
-    if (!msg) return;
-    const live = q.get("SELECT * FROM lives WHERE id=? AND status='live'", live_id);
-    if (!live) return;
-    q.run('INSERT INTO chat(live_id,user_id,message) VALUES(?,?,?)', live_id, socket.user.id, msg);
-    io.to(`live:${live_id}`).emit('chat', { name: socket.user.name, role: socket.user.role, message: msg, at: new Date().toISOString() });
-  });
-
-  socket.on('disconnect', () => {
-    const lid = socket.data.live_id;
-    if (lid && viewers.has(lid)) {
-      viewers.get(lid).delete(socket.id);
-      io.to(`live:${lid}`).emit('viewer_count', { live_id: lid, count: Math.max(0, viewers.get(lid).size - 1) });
-      if (socket.data.is_broadcaster) {
-        // Grace window: a page refresh or brief network drop must NOT end the stream.
-        // The live only ends if the broadcaster does not reconnect within 90 seconds,
-        // or when the model/admin explicitly ends it.
-        const uid = socket.user.id;
-        if (endTimers.has(lid)) clearTimeout(endTimers.get(lid));
-        endTimers.set(lid, setTimeout(() => {
-          endTimers.delete(lid);
-          const stillLive = q.get("SELECT id FROM lives WHERE id=? AND status='live'", lid);
-          if (!stillLive) return;
-          const back = [...(viewers.get(lid) || [])].some(sid => {
-            const s = io.sockets.sockets.get(sid);
-            return s && s.data.is_broadcaster;
-          });
-          if (back) return;
-          q.run("UPDATE lives SET status='ended', ended_at=datetime('now') WHERE id=? AND status='live'", lid);
-          q.run('UPDATE model_profiles SET is_live=0 WHERE user_id=?', uid);
-          io.to(`live:${lid}`).emit('live_ended', { live_id: lid });
-        }, 90000));
-        io.to(`live:${lid}`).emit('broadcaster_reconnecting', { live_id: lid });
-      }
-    }
-  });
-});
+require('./src/live-signaling')(io, q, jwt, JWT_SECRET);
 
 // Scheduled-live reminder sweep (every minute) — auto-notify when it's time
 setInterval(() => {

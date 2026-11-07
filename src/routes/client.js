@@ -68,6 +68,8 @@ router.post('/subscribe/:modelId', (req, res) => {
 // granted free by the admin, or subscribed for a subscribers-only stream)?
 // NEVER charges — used by the watch page to skip the ticket screen on re-entry/refresh.
 router.get('/lives/:id/access', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (blocked(req, res)) return;
   const live = q.get("SELECT * FROM lives WHERE id=? AND status IN ('live','scheduled')", req.params.id);
   if (!live) return res.status(404).json({ error: 'Live not found' });
   if (q.get('SELECT id FROM live_access WHERE live_id=? AND user_id=?', live.id, req.user.id)) return res.json({ access: true });
@@ -81,21 +83,24 @@ router.get('/lives/:id/access', (req, res) => {
 // Pay to access a specific live
 router.post('/lives/:id/access', (req, res) => {
   if (blocked(req, res)) return;
-  const live = q.get("SELECT * FROM lives WHERE id=? AND status IN ('live','scheduled')", req.params.id);
-  if (!live) return res.status(404).json({ error: 'Live not found' });
-  if (live.price_cents === 0) {
-    const sub = q.get("SELECT id FROM subscriptions WHERE model_id=? AND client_id=? AND status='active'", live.model_id, req.user.id);
-    if (!sub) return res.status(402).json({ error: 'This live is for subscribers only — subscribe to the model first' });
-    q.run('INSERT OR IGNORE INTO live_access(live_id,user_id,paid_cents) VALUES(?,?,0)', live.id, req.user.id);
-    return res.json({ ok: true, via: 'subscription' });
-  }
-  if (q.get('SELECT id FROM live_access WHERE live_id=? AND user_id=?', live.id, req.user.id)) return res.json({ ok: true, already: true });
-  if (!debitWallet(req.user.id, live.price_cents, 'live_ticket', `live:${live.id}`))
-    return res.status(402).json({ error: 'Insufficient balance — top up your wallet first' });
-  q.run('INSERT INTO live_access(live_id,user_id,paid_cents) VALUES(?,?,?)', live.id, req.user.id, live.price_cents);
-  const { net } = creditModel(live.model_id, live.price_cents, 'live_ticket', `live:${live.id}`);
-  notify(live.model_id, 'ticket', `${req.user.name} bought access to your live (+$${(net / 100).toFixed(2)})`);
-  res.json({ ok: true, paid_cents: live.price_cents });
+  const result = q.tx(() => {
+    const live = q.get("SELECT * FROM lives WHERE id=? AND status IN ('live','scheduled')", req.params.id);
+    if (!live) return { status: 404, error: 'Live not found' };
+    // A ticket belongs to this user/live pair, not a socket, tab, or subscription.
+    if (q.get('SELECT id FROM live_access WHERE live_id=? AND user_id=?', live.id, req.user.id)) return { ok: true, already: true };
+    if (live.price_cents === 0) {
+      if (!q.get("SELECT id FROM subscriptions WHERE model_id=? AND client_id=? AND status='active'", live.model_id, req.user.id)) return { status: 402, error: 'This live is for subscribers only — subscribe to the model first' };
+      q.run('INSERT INTO live_access(live_id,user_id,paid_cents) VALUES(?,?,0)', live.id, req.user.id);
+      return { ok: true, via: 'subscription' };
+    }
+    if (!debitWallet(req.user.id, live.price_cents, 'live_ticket', `live:${live.id}`)) return { status: 402, error: 'Insufficient balance — top up your wallet first' };
+    q.run('INSERT INTO live_access(live_id,user_id,paid_cents) VALUES(?,?,?)', live.id, req.user.id, live.price_cents);
+    const { net } = creditModel(live.model_id, live.price_cents, 'live_ticket', `live:${live.id}`);
+    notify(live.model_id, 'ticket', `${req.user.name} bought access to your live (+$${(net / 100).toFixed(2)})`);
+    return { ok: true, paid_cents: live.price_cents };
+  })();
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result);
 });
 
 // Tip a model (optionally during a live)

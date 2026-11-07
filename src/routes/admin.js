@@ -149,11 +149,54 @@ router.post('/agencies', (req, res) => {
 
 // ---------- verifications ----------
 router.get('/verifications', (req, res) => {
-  const rows = q.all(`
-    SELECT v.*, u.name, u.email, u.role, u.dob AS account_dob
-    FROM verifications v JOIN users u ON u.id=v.user_id
-    ORDER BY CASE v.status WHEN 'pending' THEN 0 ELSE 1 END, v.id DESC LIMIT 200`);
+  // Latest documents for EVERY account, including verified/rejected/no-upload users.
+  const rows = q.all(`SELECT v.*,u.id AS user_id,u.name,u.email,u.role,u.verified,u.dob AS account_dob
+    FROM users u LEFT JOIN verifications v ON v.id=(SELECT MAX(v2.id) FROM verifications v2 WHERE v2.user_id=u.id)
+    WHERE u.role!='admin'
+    ORDER BY CASE WHEN v.status='pending' THEN 0 WHEN u.verified=0 THEN 1 ELSE 2 END,u.id DESC`);
+  res.set('Cache-Control', 'no-store');
   res.json({ verifications: rows.map(v => ({ ...v, age_on_id: ageFromDob(v.dob_declared) })) });
+});
+
+function revokeLiveConnections(req, user) {
+  const io = req.app.get('io');
+  if (user.role === 'model') {
+    const lives = q.all("SELECT id FROM lives WHERE model_id=? AND status='live'", user.id);
+    q.run("UPDATE lives SET status='ended',ended_at=datetime('now') WHERE model_id=? AND status='live'", user.id);
+    q.run('UPDATE model_profiles SET is_live=0 WHERE user_id=?', user.id);
+    if (io) lives.forEach(l => {
+      io.to(`live:${l.id}`).emit('live_ended', { live_id: l.id, by: 'verification_revoked' });
+      io.in(`live:${l.id}`).disconnectSockets(true);
+    });
+  }
+  if (io) for (const socket of io.sockets.sockets.values()) {
+    if (socket.user && socket.user.id === user.id) {
+      socket.emit('error_msg', { error: 'Identity verification was revoked. Contact the administrator.' });
+      socket.disconnect(true);
+    }
+  }
+}
+
+// All status changes remain admin-only and use the existing tables.
+router.post('/users/:id/verification', (req, res) => {
+  const { verified, notes } = req.body || {};
+  if (typeof verified !== 'boolean') return res.status(400).json({ error: 'verified must be true or false' });
+  const user = q.get("SELECT * FROM users WHERE id=? AND role!='admin'", req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const latest = q.get('SELECT * FROM verifications WHERE user_id=? ORDER BY id DESC LIMIT 1', user.id);
+  if (verified) {
+    const minAge = Number(getSetting('min_age', '18'));
+    if (!latest || ageFromDob(latest.dob_declared) < minAge || latest.dob_declared !== user.dob) return res.status(400).json({ error: 'Matching, adult identity documents are required before verification' });
+  }
+  q.tx(() => {
+    q.run('UPDATE users SET verified=? WHERE id=?', verified ? 1 : 0, user.id);
+    if (verified && user.role === 'client' && user.status === 'pending') q.run("UPDATE users SET status='active' WHERE id=?", user.id);
+    if (latest) q.run("UPDATE verifications SET status=?,notes=?,reviewer_id=?,reviewed_at=datetime('now') WHERE id=?", verified?'approved':'rejected', String(notes||'').slice(0,2000), req.user.id, latest.id);
+    notify(user.id, verified?'verified':'verification_revoked', verified?'Your identity was verified by the administrator.':'Your identity verification was revoked. Please contact support or resubmit documents.');
+    audit(req.user.id, verified?'admin_verify':'admin_unverify', `user:${user.id}`);
+  })();
+  if (!verified) revokeLiveConnections(req, user);
+  res.json({ ok: true, verified });
 });
 
 router.get('/verifications/:id/file/:which', (req, res) => {
@@ -167,20 +210,21 @@ router.get('/verifications/:id/file/:which', (req, res) => {
 
 router.post('/verifications/:id/decide', (req, res) => {
   const { decision, notes } = req.body || {};
-  if (!['approved', 'rejected'].includes(decision)) return res.status(400).json({ error: 'decision must be approved|rejected' });
+  if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'decision must be approved|rejected' });
   const v = q.get('SELECT * FROM verifications WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'Not found' });
-  q.run("UPDATE verifications SET status=?, notes=?, reviewer_id=?, reviewed_at=datetime('now') WHERE id=?",
-    decision, String(notes || ''), req.user.id, v.id);
-  if (decision === 'approved') {
-    q.run('UPDATE users SET verified=1 WHERE id=?', v.user_id);
-    const u = q.get('SELECT role FROM users WHERE id=?', v.user_id);
-    if (u.role === 'client') q.run("UPDATE users SET status='active' WHERE id=?", v.user_id);
-    notify(v.user_id, 'verified', 'Your identity verification was approved by our team.');
-  } else {
-    notify(v.user_id, 'verification_rejected', `Your verification was rejected${notes ? ': ' + notes : ''}. Please re-submit valid documents.`);
-  }
-  audit(req.user.id, `verification_${decision}`, `verification:${v.id}`);
+  const latest = q.get('SELECT id FROM verifications WHERE user_id=? ORDER BY id DESC LIMIT 1', v.user_id);
+  if (latest.id !== v.id) return res.status(409).json({ error: 'Review the latest documents for this user' });
+  const user = q.get('SELECT * FROM users WHERE id=?', v.user_id);
+  if (decision === 'approved' && (ageFromDob(v.dob_declared) < Number(getSetting('min_age','18')) || v.dob_declared !== user.dob)) return res.status(400).json({ error: 'Matching, adult identity documents are required before verification' });
+  q.tx(() => {
+    q.run("UPDATE verifications SET status=?,notes=?,reviewer_id=?,reviewed_at=datetime('now') WHERE id=?", decision, String(notes||'').slice(0,2000), req.user.id, v.id);
+    q.run('UPDATE users SET verified=? WHERE id=?', decision==='approved'?1:0, user.id);
+    if (decision==='approved' && user.role==='client' && user.status==='pending') q.run("UPDATE users SET status='active' WHERE id=?", user.id);
+    notify(user.id, decision==='approved'?'verified':'verification_rejected', decision==='approved'?'Your identity verification was approved by our team.':`Your verification was rejected${notes?': '+String(notes).slice(0,2000):''}. Please re-submit valid documents.`);
+    audit(req.user.id, `verification_${decision}`, `verification:${v.id}`);
+  })();
+  if (decision==='rejected') revokeLiveConnections(req, user);
   res.json({ ok: true });
 });
 

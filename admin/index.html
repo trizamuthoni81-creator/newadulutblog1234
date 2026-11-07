@@ -53,6 +53,9 @@ input,select,textarea{background:var(--bg);border:1px solid var(--line);color:va
 img.thumb{max-width:200px;border-radius:8px;border:1px solid var(--line)}
 .toast{position:fixed;bottom:20px;right:20px;background:var(--panel);padding:14px 20px;border-radius:10px;border-left:4px solid var(--acc);animation:slide .3s;z-index:100;max-width:350px}
 @media(max-width:800px){.wrap{grid-template-columns:1fr}aside{position:sticky;top:0;z-index:10}aside a{display:inline-block}}
+button:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
+button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:4px}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
@@ -170,9 +173,9 @@ const views = {
       <td>${esc(v.id_type)}<br><span style="color:var(--mut);font-size:11px">${esc(v.id_number)}</span></td>
       <td>${esc(v.dob_declared)}</td>
       <td>${v.age_on_id>=18?badge(v.age_on_id+'y','b-ok'):badge(v.age_on_id+'y','b-bad')}</td>
-      <td>${v.status==='approved'?badge('approved','b-ok'):v.status==='rejected'?badge('rejected','b-bad'):badge('pending','b-warn')}</td>
-      <td><a href="/api/admin/verifications/${v.id}/file/id?token=${TOKEN}" target="_blank" style="color:var(--acc)">ID</a> · <a href="/api/admin/verifications/${v.id}/file/selfie?token=${TOKEN}" target="_blank" style="color:var(--acc)">Selfie</a></td>
-      <td>${v.status==='pending'?`<button class="ok" onclick="decideVer(${v.id},'approved')">Approve</button> <button class="bad" onclick="decideVer(${v.id},'rejected')">Reject</button>`:''}</td>
+      <td>${v.verified?badge('verified','b-ok'):badge(v.status||'not submitted','b-warn')}</td>
+      <td>${v.id?`<a href="/api/admin/verifications/${v.id}/file/id?token=${TOKEN}" target="_blank" rel="noopener" style="color:var(--acc)">ID</a> · <a href="/api/admin/verifications/${v.id}/file/selfie?token=${TOKEN}" target="_blank" rel="noopener" style="color:var(--acc)">Selfie</a>`:'No documents submitted'}</td>
+      <td>${v.verified?`<button class="bad" onclick="setVerification(${v.user_id},false,'verifications')">Unverify</button>`:`<button class="ok" onclick="setVerification(${v.user_id},true,'verifications')" ${v.id?'':'disabled title="Identity documents required"'}>Verify</button>`}</td>
     </tr>`).join('')||`<tr><td colspan="8" style="text-align:center;color:var(--mut)">No verifications yet.</td></tr>`}
     </tbody></table>`;
   },
@@ -207,6 +210,7 @@ const views = {
       <td>${money(u.wallet_cents)}</td>
       <td>
         ${u.status==='suspended'?`<button class="ok" onclick="setStatus(${u.id},'active')">Unsuspend</button>`:`<button class="bad" onclick="setStatus(${u.id},'suspended')">Suspend</button>`}
+        <button class="${u.verified?'bad':'ok'}" onclick="setVerification(${u.id},${!u.verified},'users')">${u.verified?'Unverify':'Verify'}</button>
         ${u.role==='client'?`<button class="warn" onclick="restrict(${u.id})">${u.restricted?'Unrestrict':'Restrict'}</button> <button class="ok" onclick="addMoney(${u.id})">💵 Add Money</button>`:''}
         ${u.role==='model'?`<button class="ok" onclick="payModel(${u.id})">💵 Pay Model</button> <button class=\"warn\" onclick=\"deductModel(${u.id})\">💸 Deduct</button> <button class="ghost" onclick="directive(${u.id})">Directive</button>`:''}
       </td>
@@ -310,6 +314,11 @@ async function show(v){
   catch(e) { body.innerHTML = `<div style="color:var(--bad);padding:20px">${esc(e.message)}</div>`; }
 }
 
+async function setVerification(id, verified, returnView){
+  if (!confirm(verified?'Verify this adult identity after reviewing the documents?':'Revoke identity verification? Any active broadcast by this user will end.')) return;
+  try { await api('/api/admin/users/'+id+'/verification',{method:'POST',body:JSON.stringify({verified})}); toast(verified?'User verified':'Verification revoked'); show(returnView||'users'); }
+  catch(e){toast(e.message);}
+}
 async function decideVer(id, decision){
   const notes = decision==='rejected' ? prompt('Rejection reason (optional):') : '';
   try { await api('/api/admin/verifications/'+id+'/decide',{method:'POST',body:JSON.stringify({decision,notes})}); toast('Done'); show('verifications'); }
